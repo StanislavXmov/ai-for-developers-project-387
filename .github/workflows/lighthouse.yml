@@ -50,22 +50,32 @@ jobs:
       - name: Install Lighthouse tooling
         run: npm install --global lighthouse wait-on
 
+      - name: Prepare report directory
+        run: mkdir -p "$REPORT_DIR"
+
       - name: Start backend
         working-directory: backend
-        run: npm run start:prod &
+        run: nohup npm run start:prod > ../lighthouse-reports/backend.log 2>&1 &
 
       - name: Start frontend
         working-directory: frontend
-        run: npm run dev -- --host 127.0.0.1 &
+        run: nohup npm run dev -- --host 127.0.0.1 > ../lighthouse-reports/frontend.log 2>&1 &
 
       - name: Wait for app
         run: |
-          wait-on --timeout 60000 http://localhost:3000
-          wait-on --timeout 60000 http://localhost:5173
+          wait-on --timeout 60000 http-get://localhost:3000/api/event-types
+          wait-on --timeout 60000 http-get://localhost:5173
+
+      - name: Print service logs on startup failure
+        if: failure()
+        run: |
+          echo "Backend log:"
+          cat "$REPORT_DIR/backend.log" || true
+          echo "Frontend log:"
+          cat "$REPORT_DIR/frontend.log" || true
 
       - name: Run Lighthouse for main pages
         run: |
-          mkdir -p "$REPORT_DIR"
           while IFS='|' read -r slug path label; do
             lighthouse "$BASE_URL$path" \
               --chrome-flags="--headless --no-sandbox" \
