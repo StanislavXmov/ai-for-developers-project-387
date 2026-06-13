@@ -181,7 +181,7 @@ export function AdminSlots({ onSaved }: AdminSlotsProps) {
                     <SelectTrigger className="w-32">
                       <SelectValue />
                     </SelectTrigger>
-                    <SelectContent className="max-h-60 overflow-y-auto">
+                    <SelectContent className="max-h-80 overflow-y-auto">
                       {TIME_OPTIONS.map((time) => (
                         <SelectItem key={time} value={time}>
                           {time}
@@ -200,7 +200,7 @@ export function AdminSlots({ onSaved }: AdminSlotsProps) {
                     <SelectTrigger className="w-32">
                       <SelectValue />
                     </SelectTrigger>
-                    <SelectContent className="max-h-60 overflow-y-auto">
+                    <SelectContent className="max-h-80 overflow-y-auto">
                       {TIME_OPTIONS.map((time) => (
                         <SelectItem key={time} value={time}>
                           {time}
