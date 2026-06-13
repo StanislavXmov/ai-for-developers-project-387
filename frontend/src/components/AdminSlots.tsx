@@ -8,9 +8,21 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+const TIME_OPTIONS = Array.from({ length: 96 }, (_, i) => {
+  const hours = Math.floor(i / 4);
+  const minutes = (i % 4) * 15;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+});
 
 const DAYS = [
   { dayOfWeek: 0, name: "Sunday" },
@@ -159,25 +171,43 @@ export function AdminSlots({ onSaved }: AdminSlotsProps) {
                   </Label>
                 </div>
                 <div className="flex items-center gap-2">
-                  <Input
-                    type="time"
+                  <Select
                     value={slot.startTime}
-                    onChange={(e) =>
-                      updateSlot(slot.dayOfWeek, "startTime", e.target.value)
+                    onValueChange={(value) =>
+                      updateSlot(slot.dayOfWeek, "startTime", value)
                     }
                     disabled={!slot.enabled}
-                    className="w-32"
-                  />
+                  >
+                    <SelectTrigger className="w-32">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {TIME_OPTIONS.map((time) => (
+                        <SelectItem key={time} value={time}>
+                          {time}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                   <span className="text-muted-foreground">to</span>
-                  <Input
-                    type="time"
+                  <Select
                     value={slot.endTime}
-                    onChange={(e) =>
-                      updateSlot(slot.dayOfWeek, "endTime", e.target.value)
+                    onValueChange={(value) =>
+                      updateSlot(slot.dayOfWeek, "endTime", value)
                     }
                     disabled={!slot.enabled}
-                    className="w-32"
-                  />
+                  >
+                    <SelectTrigger className="w-32">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {TIME_OPTIONS.map((time) => (
+                        <SelectItem key={time} value={time}>
+                          {time}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
               </div>
             );
