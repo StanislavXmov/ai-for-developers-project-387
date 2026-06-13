@@ -1,0 +1,327 @@
+name: Lighthouse performance audit
+
+"on":
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+jobs:
+  performance-audit:
+    runs-on: ubuntu-latest
+
+    env:
+      BASE_URL: http://localhost:5173
+      BASELINE_FILE: docs/performance-baseline.md
+      REPORT_DIR: lighthouse-reports
+      REGRESSION_THRESHOLD: "0.10"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm install
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Build backend
+        working-directory: backend
+        run: npm run build
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Install Lighthouse tooling
+        run: npm install --global lighthouse wait-on
+
+      - name: Start backend
+        working-directory: backend
+        run: npm run start:prod &
+
+      - name: Start frontend
+        working-directory: frontend
+        run: npm run dev -- --host 127.0.0.1 &
+
+      - name: Wait for app
+        run: |
+          wait-on --timeout 60000 http://localhost:3000
+          wait-on --timeout 60000 http://localhost:5173
+
+      - name: Run Lighthouse for main pages
+        run: |
+          mkdir -p "$REPORT_DIR"
+          while IFS='|' read -r slug path label; do
+            lighthouse "$BASE_URL$path" \
+              --chrome-flags="--headless --no-sandbox" \
+              --output=html --output=json \
+              --output-path="$REPORT_DIR/$slug" \
+              --only-categories=performance,accessibility,best-practices,seo
+          done <<'PAGES'
+          home|/|Home
+          create|/create|Create meeting
+          admin|/admin|Admin
+          PAGES
+
+      - name: Analyze performance trends
+        id: analyze
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const reportDir = process.env.REPORT_DIR;
+            const baselineFile = process.env.BASELINE_FILE;
+            const threshold = Number(process.env.REGRESSION_THRESHOLD);
+            const pages = [
+              { slug: 'home', path: '/', label: 'Home' },
+              { slug: 'create', path: '/create', label: 'Create meeting' },
+              { slug: 'admin', path: '/admin', label: 'Admin' },
+            ];
+
+            const metricLabels = {
+              lcp: 'LCP',
+              fid: 'FID',
+              cls: 'CLS',
+            };
+
+            const lowerIsBetter = new Set(['lcp', 'fid', 'cls']);
+            const readNumber = (value) => {
+              if (value === undefined || value === null) return undefined;
+              const normalized = String(value).trim().replace(',', '.');
+              const parsed = Number(normalized);
+              return Number.isFinite(parsed) ? parsed : undefined;
+            };
+
+            const parseBaseline = () => {
+              if (!fs.existsSync(baselineFile)) return new Map();
+              const lines = fs.readFileSync(baselineFile, 'utf8').split(/\r?\n/);
+              const rows = new Map();
+
+              for (const rawLine of lines) {
+                const line = rawLine.trim();
+                if (!line.startsWith('|') || /^\|\s*-/.test(line) || /page/i.test(line) && /lcp/i.test(line)) {
+                  continue;
+                }
+
+                const cells = line.split('|').slice(1, -1).map((cell) => cell.trim());
+                if (cells.length < 4) continue;
+
+                const [pagePath, lcp, fid, cls] = cells;
+                rows.set(pagePath, {
+                  lcp: readNumber(lcp),
+                  fid: readNumber(fid),
+                  cls: readNumber(cls),
+                });
+              }
+
+              return rows;
+            };
+
+            const reports = pages.map((page) => {
+              const reportPath = path.join(reportDir, `${page.slug}.report.json`);
+              const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              const audits = report.audits;
+
+              return {
+                ...page,
+                reportPath,
+                metrics: {
+                  lcp: audits['largest-contentful-paint']?.numericValue,
+                  fid: audits['max-potential-fid']?.numericValue,
+                  cls: audits['cumulative-layout-shift']?.numericValue,
+                },
+                diagnostics: {
+                  requests: audits['network-requests']?.details?.items ?? [],
+                  totalByteWeight: audits['total-byte-weight']?.numericValue,
+                  renderBlocking: audits['render-blocking-resources']?.details?.items ?? [],
+                  unusedJavascript: audits['unused-javascript']?.details?.items ?? [],
+                  unusedCss: audits['unused-css-rules']?.details?.items ?? [],
+                },
+              };
+            });
+
+            const baseline = parseBaseline();
+            const regressions = [];
+
+            for (const report of reports) {
+              const previous = baseline.get(report.path);
+              if (!previous) continue;
+
+              for (const metric of Object.keys(metricLabels)) {
+                const before = previous[metric];
+                const after = report.metrics[metric];
+                if (!Number.isFinite(before) || !Number.isFinite(after) || before <= 0) continue;
+
+                const change = lowerIsBetter.has(metric) ? (after - before) / before : (before - after) / before;
+                if (change > threshold) {
+                  regressions.push({
+                    page: report,
+                    metric,
+                    before,
+                    after,
+                    change,
+                  });
+                }
+              }
+            }
+
+            const formatMetric = (metric, value) => metric === 'cls' ? value.toFixed(3) : `${Math.round(value)} ms`;
+            const formatBytes = (bytes) => `${Math.round(bytes / 1024)} KiB`;
+            const artifactName = 'lighthouse-reports';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const heavyResources = (page) => page.diagnostics.requests
+              .filter((item) => item.transferSize > 50 * 1024)
+              .sort((a, b) => b.transferSize - a.transferSize)
+              .slice(0, 5)
+              .map((item) => `- ${item.url}: ${formatBytes(item.transferSize)}`);
+
+            const pageRecommendations = (page) => {
+              const lines = [];
+              const resources = heavyResources(page);
+
+              if (page.diagnostics.totalByteWeight) {
+                lines.push(`- Review total transferred bytes on ${page.label}: ${formatBytes(page.diagnostics.totalByteWeight)}.`);
+              }
+
+              if (resources.length) {
+                lines.push(`- Check heavy resources on ${page.label}:`);
+                lines.push(...resources);
+              }
+
+              if (page.diagnostics.renderBlocking.length) {
+                lines.push(`- Reduce render-blocking resources on ${page.label}.`);
+              }
+
+              if (page.diagnostics.unusedJavascript.length) {
+                lines.push(`- Split or remove unused JavaScript on ${page.label}.`);
+              }
+
+              if (page.diagnostics.unusedCss.length) {
+                lines.push(`- Remove unused CSS rules on ${page.label}.`);
+              }
+
+              return lines.length ? lines : [`- Open ${page.label} report and inspect Lighthouse opportunities.`];
+            };
+
+            const metricsTable = [
+              '| Page | LCP | FID proxy | CLS |',
+              '| --- | ---: | ---: | ---: |',
+              ...reports.map((report) => `| ${report.path} | ${formatMetric('lcp', report.metrics.lcp)} | ${formatMetric('fid', report.metrics.fid)} | ${formatMetric('cls', report.metrics.cls)} |`),
+            ].join('\n');
+
+            const comparisonTable = regressions.length
+              ? [
+                  '| Page | Metric | Baseline | Current | Degradation |',
+                  '| --- | --- | ---: | ---: | ---: |',
+                  ...regressions.map((item) => `| ${item.page.path} | ${metricLabels[item.metric]} | ${formatMetric(item.metric, item.before)} | ${formatMetric(item.metric, item.after)} | ${Math.round(item.change * 100)}% |`),
+                ].join('\n')
+              : 'No LCP, FID proxy, or CLS regressions above 10% were found.';
+
+            const summary = [
+              '# Lighthouse performance audit',
+              '',
+              `Run: ${runUrl}`,
+              `Baseline: \`${baselineFile}\``,
+              `Artifact: \`${artifactName}\``,
+              '',
+              '## Current metrics',
+              '',
+              metricsTable,
+              '',
+              '## Trend check',
+              '',
+              comparisonTable,
+              '',
+              'FID is compared with Lighthouse `max-potential-fid`, because real FID requires field data.',
+            ].join('\n');
+
+            await core.summary.addRaw(summary).write();
+
+            fs.writeFileSync(path.join(reportDir, 'performance-summary.md'), summary);
+
+            if (!regressions.length) {
+              core.setOutput('has_regressions', 'false');
+              core.info('No performance regressions above threshold. Skipping issue creation.');
+              return;
+            }
+
+            core.setOutput('has_regressions', 'true');
+            const affectedPages = [...new Map(regressions.map((item) => [item.page.path, item.page])).values()];
+            const prompt = [
+              'Run a performance audit for the main pages of the application.',
+              'Compare key metrics (LCP, FID, CLS) with previous results stored in docs/performance-baseline.md.',
+              'If any metric degraded by more than 10%, create or update a GitHub issue with specific recommendations for improvement.',
+              '',
+              'Context:',
+              `- GitHub Actions run: ${runUrl}`,
+              `- Lighthouse artifact: ${artifactName}`,
+              `- Baseline file: ${baselineFile}`,
+              '- Audited pages: /, /create, /admin',
+              '- FID is represented by Lighthouse max-potential-fid because real FID requires field data.',
+              '',
+              'Detected regressions:',
+              '',
+              comparisonTable,
+              '',
+              'Initial recommendations from Lighthouse diagnostics:',
+              '',
+              ...affectedPages.flatMap(pageRecommendations),
+              '',
+              'Create the issue with:',
+              '- A concise title, such as "Performance regression detected by Lighthouse".',
+              '- The affected pages and degraded metrics.',
+              '- Specific recommendations covering slower pages, heavier resources, and extra or wasteful requests.',
+              '- A link to the workflow run and a note to download the lighthouse-reports artifact for full HTML reports.',
+              '- A checklist of follow-up tasks.',
+              '',
+            ].join('\n');
+
+            fs.writeFileSync(path.join(reportDir, 'opencode-performance-prompt.md'), prompt);
+
+      - name: Run OpenCode
+        if: steps.analyze.outputs.has_regressions == 'true'
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        with:
+          model: opencode/claude-opus-4-8
+          prompt: |
+            Run a performance audit for the main pages of the application.
+            Compare key metrics (LCP, FID, CLS) with previous results stored in docs/performance-baseline.md.
+            If any metric degraded by more than 10%, create an issue with specific recommendations for improvement.
+
+            Use the generated files in lighthouse-reports/:
+            - performance-summary.md contains the current metric table and trend comparison.
+            - opencode-performance-prompt.md contains the detected regressions and initial Lighthouse recommendations.
+            - *.report.json contains full Lighthouse diagnostics per page.
+            - *.report.html contains the human-readable reports.
+
+            The issue must explain which pages slowed down, which resources became heavier, and where Lighthouse found extra or wasteful requests.
+            Include the GitHub Actions run link and tell the team to download the lighthouse-reports artifact for the full HTML reports.
+
+      - name: Upload Lighthouse reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-reports
+          path: lighthouse-reports/
+          retention-days: 14
+          if-no-files-found: warn
